@@ -68,7 +68,7 @@ def build_otlp_trace(state):
     model_span = create_span(state["modelSpanId"], state["agentSpanId"], "chat incident-plan", 3)
     model_span["attributes"].extend([
         {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
-        {"key": "gen_ai.request.model", "value": {"stringValue": "google/gemini-2.5-flash"}}
+        {"key": "gen_ai.request.model", "value": {"stringValue": "openai/gpt-4o-mini"}} # UPDATED MODEL HERE
     ])
     spans.append(model_span)
     
@@ -155,7 +155,12 @@ def format_response(state):
 # ---------------------------------------------------------
 @app.post("/v2/incidents")
 async def create_incident(request: Request):
-    body = await request.json()
+    # FIX: Catch broken JSON from the validation probe
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
     if body.get("profile") != "ga5-incident-agent/v2":
         raise HTTPException(status_code=400, detail="Unsupported profile")
         
@@ -185,8 +190,9 @@ async def create_incident(request: Request):
         "Content-Type": "application/json"
     }
     
+    # FIX: Switched to guaranteed supported model for AIPipe proxy
     payload = {
-        "model": "google/gemini-2.5-flash",
+        "model": "openai/gpt-4o-mini",
         "messages": [{"role": "user", "content": prompt}],
         "response_format": {"type": "json_object"}
     }
@@ -251,7 +257,12 @@ async def create_incident(request: Request):
 
 @app.post("/v2/incidents/{run_id}/receipts")
 async def handle_receipt(run_id: str, request: Request):
-    body = await request.json()
+    # FIX: Catch broken JSON here too just in case
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
     receipt_id = body.get("receiptId")
     content_hash = canonical_hash(body)
     
