@@ -75,9 +75,15 @@ def a2a_response(content, status_code=200):
 # ---------------------------------------------------------
 @app.get("/.well-known/agent-card.json")
 async def get_agent_card(request: Request):
-    scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
-    host = request.headers.get("host", request.url.netloc)
-    base_url = f"{scheme}://{host}"
+    # 🚨 HARDCODE YOUR RENDER BASE URL HERE 🚨
+    # DO NOT include a trailing slash (/) at the end
+    base_url = "https://final-q.onrender.com"
+    
+    # Fallback just in case you forget to replace the string above
+    if "YOUR-APP-NAME" in base_url:
+        scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
+        host = request.headers.get("host", request.url.netloc)
+        base_url = f"{scheme}://{host}"
     
     return a2a_response({
         "name": "AI Invoice Agent",
@@ -141,7 +147,6 @@ async def handle_message(request: Request, principal: str = Depends(verify_a2a_h
             raise HTTPException(status_code=500, detail="GEMINI_API_KEY not set")
         client = genai.Client(api_key=gemini_key)
         
-        # FIX: Structured JSON Schema forces Gemini to return the exact types and array sizes
         schema = types.Schema(
             type=types.Type.OBJECT,
             properties={
@@ -198,7 +203,6 @@ async def handle_message(request: Request, principal: str = Depends(verify_a2a_h
                 except Exception:
                     ai_decision = {"action": "open_exception", "facts": {"vendorName": "Unknown", "invoiceNumber": "0", "amountMinor": 0, "currency": "USD"}, "evidenceRefs": ["[fallback_1]", "[fallback_2]", "[fallback_3]"], "rationale": "Fallback exception triggered due to processing failure citing [fallback_1] and [fallback_2]."}
 
-            # Force exact array slice for 3 refs to guarantee schema compliance
             refs = ai_decision.get("evidenceRefs", [])
             while len(refs) < 3: refs.append("[missing]")
             refs = refs[:3]
@@ -224,7 +228,6 @@ async def handle_message(request: Request, principal: str = Depends(verify_a2a_h
         }
 
         with db_lock:
-            # Check idempotency one last time before saving
             row = cursor.execute("SELECT message_hash FROM idempotency WHERE principal=? AND message_id=?", (principal, message_id)).fetchone()
             if not row:
                 cursor.execute("INSERT INTO tasks (task_id, principal, status, task_json) VALUES (?, ?, ?, ?)", (task_id, principal, "TASK_STATE_INPUT_REQUIRED", json.dumps(task)))
@@ -246,7 +249,6 @@ async def handle_message(request: Request, principal: str = Depends(verify_a2a_h
             
             current_status, task_json_str = t_row
             
-            # FIX: Properly handle the Receipt vs Cancel Race Condition
             if current_status == "TASK_STATE_CANCELED":
                 return a2a_response({"error": "CONFLICT", "message": "Task already canceled"}, status_code=409)
                 
@@ -256,7 +258,6 @@ async def handle_message(request: Request, principal: str = Depends(verify_a2a_h
             task = json.loads(task_json_str)
             original_proposals = task["artifacts"][0]["data"]["proposals"]
             
-            # FIX: Ensure absolute validation of incoming continuation
             if data.get("batchId") != task["artifacts"][0]["data"]["batchId"]:
                 raise HTTPException(status_code=400, detail="Batch mismatch")
                 
@@ -323,7 +324,6 @@ async def cancel_task(task_id: str, principal: str = Depends(verify_a2a_headers)
             
         current_status, task_json_str = row
         
-        # If the result receipt won the race, reject cancellation
         if current_status == "TASK_STATE_COMPLETED":
             return a2a_response({"error": "CONFLICT", "message": "Task already completed"}, status_code=409)
             
