@@ -60,7 +60,7 @@ def build_otlp_trace(state):
     spans = []
     
     # 1. SERVER Span
-    spans.append(create_span(state["serverSpanId"], None, "POST /v2/incidents", 2))
+    spans.append(create_span(state["serverSpanId"], state.get("incomingParentSpanId"), "POST /v2/incidents", 2))
     
     # 2. INTERNAL Agent Span
     spans.append(create_span(state["agentSpanId"], state["serverSpanId"], "invoke_agent incident-response", 1))
@@ -122,7 +122,17 @@ def build_otlp_trace(state):
     # 5. FAN OUT JOIN
     diag_count = len(set(d["actionId"] for d in state["actionLog"] if d.get("phase") == "diagnostic"))
     if diag_count > 1:
-        spans.append(create_span(secrets.token_hex(8), state["agentSpanId"], "incident.join", 1))
+        join_span = create_span(secrets.token_hex(8), state["agentSpanId"], "incident.join", 1)
+        # FIX: The join span MUST link to every independent diagnostic tool span
+        links = []
+        for d in state["actionLog"]:
+            if d.get("phase") == "diagnostic":
+                l_id = logical_map[d["actionId"]]
+                if not any(lnk["spanId"] == l_id for lnk in links):
+                    links.append({"traceId": state["traceId"], "spanId": l_id})
+        if links:
+            join_span["links"] = links
+        spans.append(join_span)
         
     # 6. APPROVAL GATE
     approval_receipt = next((r for r in state["receiptLog"] if "approvalId" in r), None)
@@ -175,11 +185,44 @@ async def create_incident(request: Request):
             return JSONResponse(status_code=409, content={"error": "Conflict"})
         return format_response(json.loads(row[1]))
         
+    # FIX: Check for incoming traceparent header to preserve global trace continuity
+    incoming_traceparent = request.headers.get("traceparent")
+    incoming_tracestate = request.headers.get("tracestate")
+    
+    if incoming_traceparent:
+        parts = incoming_traceparent.split("-")
+        trace_id = parts[1]
+        server_parent_span_id = parts[2]
+    else:
+        trace_id = secrets.token_hex(16)
+        server_parent_span_id = None
+        incoming_tracestate = None
+        
     # 2. AI Processing via Gemini API
     safe_body = body.copy()
-    safe_body.pop("sensitive", None) # Redaction requirement
+    safe_body.pop("sensitive", None) 
     
-    prompt = f"Analyze incident: {json.dumps(safe_body)}. Pick exactly 1 rootCause from allowedRootCauses. Pick 2 to 4 evidence IDs. Pick 1 diagnostic tool from the catalog to confirm. Output strictly JSON with keys: rootCause (str), evidence (list of str), diagnostics (list of dicts with toolName, arguments dict, and evidence list of str), effectToolName (str), effectArguments (dict)."
+    prompt = f"""
+    You are an SRE incident agent. Read this incident carefully:
+    {json.dumps(safe_body)}
+
+    Rules:
+    1. Pick exactly 1 rootCause from allowedRootCauses.
+    2. Pick 2 to 4 evidence IDs (e.g., "[ev_123]") from the transcript that explicitly prove it. Do not duplicate IDs.
+    3. Pick 1 to 3 diagnostic tools from the toolCatalog to confirm it. Provide EXACT arguments based on the incident text.
+    4. Pick exactly 1 effect tool from policy.effectTools for recovery. Provide EXACT arguments.
+    
+    Output strictly JSON matching this structure:
+    {{
+      "rootCause": "string",
+      "evidence": ["string"],
+      "diagnostics": [
+        {{"toolName": "string", "arguments": {{"key": "value"}}, "evidence": ["string"]}}
+      ],
+      "effectToolName": "string",
+      "effectArguments": {{"key": "value"}}
+    }}
+    """
     
     gemini_key = os.environ.get("GEMINI_API_KEY")
     if not gemini_key:
@@ -188,26 +231,13 @@ async def create_incident(request: Request):
     try:
         client = genai.Client(api_key=gemini_key)
         
-        # FIX 1: Explicitly lower safety filters so Red-Team prompts don't crash the server
         config = types.GenerateContentConfig(
             response_mime_type="application/json",
             safety_settings=[
-                types.SafetySetting(
-                    category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-                    threshold=types.HarmBlockThreshold.BLOCK_NONE,
-                ),
-                types.SafetySetting(
-                    category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
-                    threshold=types.HarmBlockThreshold.BLOCK_NONE,
-                ),
-                types.SafetySetting(
-                    category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-                    threshold=types.HarmBlockThreshold.BLOCK_NONE,
-                ),
-                types.SafetySetting(
-                    category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-                    threshold=types.HarmBlockThreshold.BLOCK_NONE,
-                )
+                types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+                types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+                types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+                types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=types.HarmBlockThreshold.BLOCK_NONE)
             ]
         )
         
@@ -227,24 +257,17 @@ async def create_incident(request: Request):
             
     except Exception as e:
         print(f"CRITICAL AI ERROR: {str(e)}") 
-        # FIX 2: The Fail-Safe Fallback. If Gemini crashes or times out, return safe defaults 
-        # instead of a 502 to ensure the grading transport checks pass.
-        ai_plan = {
-            "rootCause": "unknown_failure", 
-            "evidence": ["[ev_fallback]"], 
-            "diagnostics": [{"toolName": "query_metrics", "arguments": {}, "evidence": ["[ev_fallback]"]}], 
-            "effectToolName": "no_action", 
-            "effectArguments": {}
-        }
+        raise HTTPException(status_code=502, detail=f"AI service failed: {str(e)}")
     
-    trace_id = secrets.token_hex(16)
     state = {
         "runId": run_id, "status": "waiting", "publicMarker": body.get("publicMarker"),
         "traceId": trace_id, "serverSpanId": secrets.token_hex(8),
+        "incomingParentSpanId": server_parent_span_id,
+        "incomingTracestate": incoming_tracestate,
         "agentSpanId": secrets.token_hex(8), "modelSpanId": secrets.token_hex(8),
-        "diagnosis": {"rootCause": ai_plan.get("rootCause", "unknown_failure"), "evidence": ai_plan.get("evidence", [])},
+        "diagnosis": {"rootCause": ai_plan.get("rootCause"), "evidence": ai_plan.get("evidence", [])},
         "dispatches": [], "approvals": [], "actionLog": [], "receiptLog": [],
-        "chosenEffect": ai_plan.get("effectToolName", "no_action"), "effectArguments": ai_plan.get("effectArguments", {}),
+        "chosenEffect": ai_plan.get("effectToolName"), "effectArguments": ai_plan.get("effectArguments", {}),
         "policy": body.get("policy", {})
     }
     
@@ -252,20 +275,25 @@ async def create_incident(request: Request):
     for diag in ai_plan.get("diagnostics", []):
         span_id = secrets.token_hex(8)
         
-        cited_evidence = []
-        if state["diagnosis"]["evidence"]:
-            cited_evidence = [state["diagnosis"]["evidence"][0]]
+        # Ensure exact formatting of the diagnostic evidence
+        diag_evidence = diag.get("evidence", [])
+        if not isinstance(diag_evidence, list) or len(diag_evidence) == 0:
+            diag_evidence = [state["diagnosis"]["evidence"][0]] if state["diagnosis"]["evidence"] else []
             
         dispatch = {
             "actionId": f"act_{secrets.token_hex(4)}",
             "callId": f"call_{secrets.token_hex(4)}",
             "phase": "diagnostic",
-            "toolName": diag.get("toolName", "query_metrics"),
+            "toolName": diag.get("toolName"),
             "arguments": diag.get("arguments", {}),
-            "evidence": cited_evidence, 
+            "evidence": diag_evidence, 
             "attempt": 1,
             "traceparent": f"00-{trace_id}-{span_id}-01"
         }
+        
+        if incoming_tracestate:
+            dispatch["tracestate"] = incoming_tracestate
+            
         state["dispatches"].append(dispatch)
         state["actionLog"].append(dispatch)
         
@@ -306,16 +334,16 @@ async def handle_receipt(run_id: str, request: Request):
             state["receiptLog"].append(outcome)
             state["dispatches"].remove(active)
             
-            if outcome.get("status") == 503: # Handle Retry Requirement
+            if outcome.get("status") == 503: 
+                # FIX: Keep EXACT SAME callId for retries! Only generate new span ID.
                 span_id = secrets.token_hex(8)
                 retry = active.copy()
                 retry["attempt"] += 1
-                retry["callId"] = f"call_{secrets.token_hex(4)}"
                 retry["traceparent"] = f"00-{state['traceId']}-{span_id}-01"
                 state["dispatches"].append(retry)
                 state["actionLog"].append(retry)
                 
-            elif outcome.get("errorType") == "timeout": # Handle Timeout Requirement
+            elif outcome.get("errorType") == "timeout": 
                 state["status"] = "failed"
                 state["dispatches"] = []
                 break
@@ -346,6 +374,9 @@ async def handle_receipt(run_id: str, request: Request):
                 effect_dispatch["arguments"]["approvalId"] = app_receipt["approvalId"]
                 effect_dispatch["arguments"]["approvalNonce"] = app_receipt["nonce"]
                 
+                if state.get("incomingTracestate"):
+                    effect_dispatch["tracestate"] = state["incomingTracestate"]
+                
                 state["dispatches"].append(effect_dispatch)
                 state["actionLog"].append(effect_dispatch)
                 
@@ -371,6 +402,9 @@ async def handle_receipt(run_id: str, request: Request):
                 "attempt": 1, 
                 "traceparent": f"00-{state['traceId']}-{span_id}-01"
             }
+            if state.get("incomingTracestate"):
+                effect_dispatch["tracestate"] = state["incomingTracestate"]
+                
             state["dispatches"].append(effect_dispatch)
             state["actionLog"].append(effect_dispatch)
             
