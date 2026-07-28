@@ -192,12 +192,25 @@ async def create_incident(request: Request):
     }
     
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post("https://aipipe.org/openrouter/v1/chat/completions", json=payload, headers=headers)
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            resp = await client.post("https://aipipe.org/api/v1/chat/completions", json=payload, headers=headers)
+            
+            if resp.status_code != 200:
+                raise Exception(f"AIPipe returned status {resp.status_code}: {resp.text}")
+                
             resp_data = resp.json()
-            ai_response_text = resp_data["choices"][0]["message"]["content"]
+            ai_response_text = resp_data["choices"][0]["message"]["content"].strip()
+            
+            # Strip Markdown codeblocks that cause json.loads() to crash
+            if ai_response_text.startswith("```json"):
+                ai_response_text = ai_response_text[7:-3].strip()
+            elif ai_response_text.startswith("```"):
+                ai_response_text = ai_response_text[3:-3].strip()
+                
             ai_plan = json.loads(ai_response_text)
+            
     except Exception as e:
+        print(f"CRITICAL AI ERROR: {str(e)}") 
         raise HTTPException(status_code=502, detail=f"AI service failed: {str(e)}")
     
     trace_id = secrets.token_hex(16)
@@ -215,7 +228,6 @@ async def create_incident(request: Request):
     for diag in ai_plan.get("diagnostics", []):
         span_id = secrets.token_hex(8)
         
-        # Ensure we always have at least one piece of evidence cited if available
         cited_evidence = []
         if state["diagnosis"]["evidence"]:
             cited_evidence = [state["diagnosis"]["evidence"][0]]
