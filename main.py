@@ -3,9 +3,10 @@ import json
 import sqlite3
 import secrets
 import hashlib
-import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
+from google import genai
+from google.genai import types
 
 app = FastAPI()
 
@@ -68,7 +69,7 @@ def build_otlp_trace(state):
     model_span = create_span(state["modelSpanId"], state["agentSpanId"], "chat incident-plan", 3)
     model_span["attributes"].extend([
         {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
-        {"key": "gen_ai.request.model", "value": {"stringValue": "openai/gpt-4o-mini"}} # UPDATED MODEL HERE
+        {"key": "gen_ai.request.model", "value": {"stringValue": "gemini-2.5-flash"}}
     ])
     spans.append(model_span)
     
@@ -175,45 +176,26 @@ async def create_incident(request: Request):
             return JSONResponse(status_code=409, content={"error": "Conflict"})
         return format_response(json.loads(row[1]))
         
-    # 2. AI Processing via AIPipe
+    # 2. AI Processing via Gemini API
     safe_body = body.copy()
     safe_body.pop("sensitive", None) # Redaction requirement
     
     prompt = f"Analyze incident: {json.dumps(safe_body)}. Pick exactly 1 rootCause from allowedRootCauses. Pick 2 to 4 evidence IDs. Pick 1 diagnostic tool from the catalog to confirm. Output strictly JSON with keys: rootCause (str), evidence (list of str), diagnostics (list of dicts with toolName, arguments dict, and evidence list of str), effectToolName (str), effectArguments (dict)."
     
-    aipipe_token = os.environ.get("AI_PIPE_TOKEN")
-    if not aipipe_token:
-        raise HTTPException(status_code=500, detail="AI_PIPE_TOKEN environment variable is not set")
-
-    headers = {
-        "Authorization": f"Bearer {aipipe_token}",
-        "Content-Type": "application/json"
-    }
-    
-    # FIX: Switched to guaranteed supported model for AIPipe proxy
-    payload = {
-        "model": "openai/gpt-4o-mini",
-        "messages": [{"role": "user", "content": prompt}],
-        "response_format": {"type": "json_object"}
-    }
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    if not gemini_key:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY environment variable is not set")
     
     try:
-        async with httpx.AsyncClient(timeout=45.0) as client:
-            resp = await client.post("https://aipipe.org/api/v1/chat/completions", json=payload, headers=headers)
-            
-            if resp.status_code != 200:
-                raise Exception(f"AIPipe returned status {resp.status_code}: {resp.text}")
-                
-            resp_data = resp.json()
-            ai_response_text = resp_data["choices"][0]["message"]["content"].strip()
-            
-            # Strip Markdown codeblocks that cause json.loads() to crash
-            if ai_response_text.startswith("```json"):
-                ai_response_text = ai_response_text[7:-3].strip()
-            elif ai_response_text.startswith("```"):
-                ai_response_text = ai_response_text[3:-3].strip()
-                
-            ai_plan = json.loads(ai_response_text)
+        client = genai.Client(api_key=gemini_key)
+        # We explicitly force Gemini to return JSON
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json")
+        )
+        
+        ai_plan = json.loads(response.text)
             
     except Exception as e:
         print(f"CRITICAL AI ERROR: {str(e)}") 
